@@ -4,7 +4,7 @@ from pathlib import Path
 # Standardpfad mit Fallback
 SCREENSHOT_DIR = os.getenv(
     "SCREENSHOT_DIR",
-    "/home/bastian/ownCloud/Persönlich/coffeeproject/Projekt Fitness/Strava_Screenshots"
+    "/home/git/ProjektFitness/screenshots"
 )
 
 def validate_screenshot_dir():
