@@ -1,0 +1,10 @@
+# Datenbank
+database/
+*.db
+*.sqlite
+
+# Screenshots
+screenshots/
+
+# Umgebungsvariablen
+.env
