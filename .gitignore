@@ -8,3 +8,7 @@ screenshots/
 
 # Umgebungsvariablen
 .env
+
+# Python-Cache
+__pycache__/
+*.py[cod]
