@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Strava Screenshot Agent - Extrahiert Trainingsdaten via Gemini Vision."""
+"""Strava Screenshot Agent - Extrahiert Trainingsdaten via Tesseract/Gemini OCR."""
 
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -18,9 +19,17 @@ from config import (
     GEMINI_MODEL,
     GEMINI_PROMPT,
     IMAGE_EXTENSIONS,
+    OCR_ENGINE,
+    FALLBACK_TO_GEMINI,
     PROCESSED_DIR,
     SCREENSHOTS_DIR,
+    TESSERACT_CONFIG,
+    TESSERACT_LANG,
+    TESSERACT_TIMEOUT,
+    TESSERACT_MAX_WIDTH,
 )
+from ocr_engine import TesseractEngine, GeminiEngine
+from parser import parse_training_data
 
 # Rate-Limit: Pause zwischen API-Calls (Sekunden)
 API_DELAY = 4
@@ -67,60 +76,76 @@ def find_new_screenshots(known: set[str]) -> list[Path]:
 
 
 def analyze_screenshot(client: genai.Client, image_path: Path) -> dict | None:
-    """Sendet Screenshot an Gemini und extrahiert Trainingsdaten."""
-    print(f"  Analysiere: {image_path.name} ...", end=" ", flush=True)
+    """Analysiert Screenshot mit ausgewählter OCR-Engine.
+    
+    Args:
+        client: Google GenAI Client
+        image_path: Pfad zum Screenshot
+        
+    Returns:
+        Extrahierte Trainingsdaten oder None bei Fehler
+    """
+    logger.info(f"Analysiere: {image_path.name}...")
 
-    image_bytes = image_path.read_bytes()
-    mime = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
+    # Engine basierend auf Konfiguration auswählen
+    if OCR_ENGINE == "tesseract":
+        ocr_engine = TesseractEngine(
+            TESSERACT_CONFIG,
+            TESSERACT_LANG,
+            timeout=TESSERACT_TIMEOUT,
+            max_width=TESSERACT_MAX_WIDTH,
+        )
+    else:
+        ocr_engine = GeminiEngine(client, GEMINI_PROMPT, GEMINI_MODEL)
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=[
-                    GEMINI_PROMPT,
-                    genai.types.Part.from_bytes(data=image_bytes, mime_type=mime),
-                ],
-            )
-            break
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "ResourceExhausted" in err_str:
-                wait = API_DELAY * (2 ** attempt)
-                print(f"Rate-Limit, warte {wait}s ...", end=" ", flush=True)
-                time.sleep(wait)
-                if attempt == MAX_RETRIES:
-                    print("FEHLER (Rate-Limit)")
-                    return None
-            else:
-                print(f"FEHLER ({e})")
+    # Text extrahieren
+    raw_text = ocr_engine.extract_text(image_path)
+
+    if raw_text is None:
+        logger.warning(f"OCR fehlgeschlagen: {image_path.name}")
+        # Fallback zu Gemini, falls aktiviert
+        if (FALLBACK_TO_GEMINI and
+            OCR_ENGINE == "tesseract" and
+            os.getenv("GEMINI_API_KEY")):
+            logger.info("Versuche Gemini-Fallback...")
+            fallback_engine = GeminiEngine(client, GEMINI_PROMPT, GEMINI_MODEL)
+            raw_text = fallback_engine.extract_text(image_path)
+            if raw_text is None:
+                logger.error(f"Fallback fehlgeschlagen für {image_path.name}")
                 return None
+            logger.info(f"Fallback erfolgreich für {image_path.name}")
+        else:
+            logger.error(f"Kein Fallback verfügbar für {image_path.name}")
+            return None
 
-    raw_text = response.text.strip()
-
-    # JSON aus Antwort extrahieren (Gemini wraps manchmal in ```json...```)
-    if raw_text.startswith("```"):
-        lines = raw_text.split("\n")
-        raw_text = "\n".join(lines[1:-1])
-
-    try:
-        data = json.loads(raw_text)
-        print("OK")
-        return data
-    except json.JSONDecodeError as e:
-        print(f"FEHLER (JSON ungueltig: {e})")
-        print(f"  Gemini-Antwort: {raw_text[:200]}")
+    # Parsen des Rohtexts
+    data = parse_training_data(raw_text)
+    if not data or not data.get("disziplin"):
+        logger.error(f"Keine gültigen Daten extrahiert aus {image_path.name}")
         return None
+
+    logger.info(f"Erfolgreich analysiert: {image_path.name}")
+    return data
 
 
 def save_to_db(conn: sqlite3.Connection, data: dict, screenshot_name: str, raw_json: str):
-    """Speichert extrahierte Daten in die DB."""
+    """Speichert extrahierte Daten in die DB.
+    
+    Args:
+        conn: SQLite-Verbindung
+        data: Extrahierte Trainingsdaten
+        screenshot_name: Dateiname des Screenshots
+        raw_json: Roh-JSON von der OCR-Engine
+        
+    Returns:
+        ID des erstellten Sessions-Eintrags
+    """
     cursor = conn.execute(
         """INSERT INTO sessions
            (datum, uhrzeit, aktivitaet_name, disziplin, distanz_m,
             dauer_sekunden, dauer_text, tempo, herzfrequenz_avg,
-            kalorien, geraet, screenshot, roh_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            kalorien, geraet, screenshot, roh_json, roh_text)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             data.get("datum"),
             data.get("uhrzeit"),
@@ -135,6 +160,7 @@ def save_to_db(conn: sqlite3.Connection, data: dict, screenshot_name: str, raw_j
             data.get("geraet"),
             screenshot_name,
             raw_json,
+            data.get("roh_text"),  # NEU: Rohtext aus OCR
         ),
     )
     session_id = cursor.lastrowid
@@ -170,14 +196,23 @@ def move_to_processed(image_path: Path):
 
 
 def main():
+    """Hauptfunktion für die Screenshot-Verarbeitung."""
+    # Logging konfigurieren
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+    global logger
+    logger = logging.getLogger(__name__)
+
     # .env laden
     env_path = Path(__file__).parent / ".env"
     load_dotenv(env_path)
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or api_key == "your-api-key-here":
-        print("FEHLER: Bitte GEMINI_API_KEY in .env setzen!")
-        print(f"  Datei: {env_path}")
+        logger.error("Bitte GEMINI_API_KEY in .env setzen!")
+        logger.error(f"  Datei: {env_path}")
         sys.exit(1)
 
     # Gemini Client erstellen (neues SDK)
@@ -191,11 +226,11 @@ def main():
     new_files = find_new_screenshots(known)
 
     if not new_files:
-        print("Keine neuen Screenshots gefunden.")
+        logger.info("Keine neuen Screenshots gefunden.")
         conn.close()
         return
 
-    print(f"{len(new_files)} neue Screenshot(s) gefunden.\n")
+    logger.info(f"{len(new_files)} neue Screenshot(s) gefunden.")
 
     imported = 0
     errors = 0
@@ -217,8 +252,7 @@ def main():
         imported += 1
 
     conn.close()
-
-    print(f"\nFertig: {imported} importiert, {errors} Fehler.")
+    logger.info(f"Fertig: {imported} importiert, {errors} Fehler.")
 
 
 if __name__ == "__main__":

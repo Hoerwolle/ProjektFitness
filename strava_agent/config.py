@@ -3,11 +3,21 @@
 import os
 from pathlib import Path
 
-# Basis-Pfade
-PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-SCREENSHOTS_DIR = PROJECT_DIR / "Strava_Screenshots"
+# Basis-Pfade (KORRIGIERT)
+PROJECT_DIR = Path(__file__).resolve().parent
+SCREENSHOTS_DIR = Path("~/opencloud/coffeeproject/Projekt Fitness/Strava_Screenshots").expanduser()
 PROCESSED_DIR = SCREENSHOTS_DIR / "verarbeitet"
 DB_PATH = PROJECT_DIR / "training.db"
+
+# OCR-Engine-Einstellungen
+OCR_ENGINE = "tesseract"  # Standard: "tesseract" oder "gemini"
+FALLBACK_TO_GEMINI = True  # Fallback zu Gemini aktivieren, falls Tesseract scheitert
+
+# Tesseract-Konfiguration
+TESSERACT_CONFIG = "--psm 6 --oem 3"  # PSM 6: Einzelner Textblock, OEM 3: LSTM + Legacy
+TESSERACT_LANG = "deu+eng"  # Deutsch + Englisch
+TESSERACT_TIMEOUT = 30  # Zeitlimit für Tesseract (Sekunden)
+TESSERACT_MAX_WIDTH = 2000  # Maximale Breite für Bildskalierung (Pixel)
 
 # Unterstützte Bildformate
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
@@ -55,7 +65,7 @@ Regeln:
 - NUR JSON ausgeben, kein anderer Text
 """
 
-# DB Schema
+# DB Schema (ERWEITERT mit roh_text)
 DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,6 +82,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     geraet          TEXT,
     screenshot      TEXT NOT NULL,
     roh_json        TEXT,
+    roh_text        TEXT,
     synced          INTEGER DEFAULT 0,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
